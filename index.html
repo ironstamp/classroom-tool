@@ -909,6 +909,13 @@ function sanitiseLinks(linksStr) {
     .filter(s => s.startsWith('http'))
     .map(url => ({ link: { url } }));
 }
+const MAX_MATERIALS = 20; // Google Classroom allows at most 20 attachments per post
+function rowsOverLinkLimit(rows) {
+  return (rows || [])
+    .filter(r => r[0] === 'MATERIAL' || r[0] === 'ASSIGNMENT')
+    .map(r => ({ title: r[2] || '(untitled)', n: sanitiseLinks(r[7]).length }))
+    .filter(x => x.n > MAX_MATERIALS);
+}
 function toScheduledTime(dateStr, timeStr) {
   const offset = -new Date().getTimezoneOffset();
   const sign = offset >= 0 ? '+' : '-';
@@ -2174,7 +2181,13 @@ async function previewSheet() {
     }
 
     const preview = document.getElementById('ul-preview-area');
-    preview.innerHTML = `
+    const over = rowsOverLinkLimit(rows);
+    const overHtml = over.length ? `
+      <div style="background:#FDECEA;border:1.5px solid #E57373;color:#B71C1C;border-radius:8px;padding:10px 12px;margin-bottom:12px;font-size:12.5px;line-height:1.5;">
+        <strong>⚠️ Too many links - upload is blocked.</strong> Classroom allows at most ${MAX_MATERIALS} attachments per post. Split or trim these rows, then Validate again:
+        <ul style="margin:6px 0 0 18px;padding:0;">${over.map(x => `<li>${escHtml(x.title)} - ${x.n} links</li>`).join('')}</ul>
+      </div>` : '';
+    preview.innerHTML = overHtml + `
       <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px;">
         <span class="tag" style="background:var(--plum-pale);color:var(--plum-dark);">📂 ${counts.TOPIC} topics</span>
         <span class="tag" style="background:#E3F2FD;color:#1565C0;">📝 ${counts.ASSIGNMENT} assignments</span>
@@ -2195,7 +2208,8 @@ async function previewSheet() {
       ${rows.length > 20 ? `<div style="font-size:12px;color:var(--text-muted);margin-top:8px;text-align:right;">Showing 20 of ${rows.length} rows</div>` : ''}
     `;
     hideSpinner();
-    toast(`Found ${rows.length} rows`, 'info');
+    if (over.length) toast(`${over.length} row(s) have more than ${MAX_MATERIALS} links - fix before uploading`, 'error', 8000);
+    else toast(`Found ${rows.length} rows`, 'info');
   } catch(e) {
     hideSpinner();
     toast('Failed to read sheet: ' + e.message, 'error');
@@ -2204,6 +2218,47 @@ async function previewSheet() {
 
 async function uploadCourse() {
   if (!state.uploadPreview) { toast('Preview the sheet first', 'error'); return; }
+  const over = rowsOverLinkLimit(state.uploadPreview);
+  if (over.length) {
+    toast(`Upload blocked: more than ${MAX_MATERIALS} links in ` + over.map(x => `"${escHtml(x.title)}" (${x.n})`).join(', '), 'error', 10000);
+    return;
+  }
+  const undo = [];                       // [collection, id] for everything created so far
+  const ctx = { courseId: null, newCourse: false, current: '' };
+  try {
+    await uploadCourseRun(undo, ctx);
+  } catch (e) {
+    await rollbackUpload(undo, ctx, e);
+  }
+}
+
+async function rollbackUpload(undo, ctx, err) {
+  showSpinner('Upload failed - cleaning up Classroom…');
+  let cleaned = 0, failed = 0, how = '';
+  if (ctx.courseId) {
+    if (ctx.newCourse) {
+      try {
+        await api('PATCH', `${CLASSROOM}/courses/${ctx.courseId}?updateMask=courseState`, { courseState: 'ARCHIVED' });
+        await api('DELETE', `${CLASSROOM}/courses/${ctx.courseId}`);
+        cleaned = 1; how = 'The partly-created course was deleted.';
+      } catch (e2) {
+        failed = 1; how = 'Could not delete the partly-created course automatically - please remove it in Classroom.';
+      }
+    } else {
+      for (const [kind, id] of undo.slice().reverse()) {
+        try { await api('DELETE', `${CLASSROOM}/courses/${ctx.courseId}/${kind}/${id}`); cleaned++; }
+        catch (_) { failed++; }
+      }
+      how = failed ? `Removed ${cleaned} item(s); ${failed} could not be removed - check the course in Classroom.`
+                   : `Removed the ${cleaned} item(s)/topic(s) created before the error.`;
+    }
+  }
+  hideSpinner();
+  try { await loadAllCourses(); } catch (_) {}
+  toast(`Upload failed${ctx.current ? ` at "${escHtml(ctx.current)}"` : ''}: ${escHtml(err.message)}. ${how}`, 'error', 15000);
+}
+
+async function uploadCourseRun(undo, ctx) {
   const isExisting = state.uploadMode === 'existing';
 
   let courseId, courseName, courseLink;
@@ -2212,6 +2267,7 @@ async function uploadCourse() {
     courseId = document.getElementById('ul-existing-course').value;
     if (!courseId) { toast('Select an existing course', 'error'); return; }
     const course = state.courses.find(c => c.id === courseId);
+    ctx.courseId = courseId;
     courseName = course?.name || 'Existing course';
     courseLink = course?.alternateLink;
 
@@ -2227,6 +2283,7 @@ async function uploadCourse() {
     const topicRows = state.uploadPreview.filter(r => r[0] === 'TOPIC' && r[2] && !topicIdMap[r[2]]);
     await Promise.all(topicRows.map(async r => {
       const t = await api('POST', `${CLASSROOM}/courses/${courseId}/topics`, { name: r[2] });
+      undo.push(['topics', t.topicId]);
       topicIdMap[r[2]] = t.topicId;
     }));
 
@@ -2238,6 +2295,7 @@ async function uploadCourse() {
       const [type, topicName, title, desc, dueDate, dueTime, maxPts, links, rowState, schedDate, schedTime] = r;
       if (!title && type !== 'ANNOUNCEMENT') continue;
       showProgress(created + 1, workRows.length, 'Creating item');
+      ctx.current = title || type;
       const topicId = topicIdMap[topicName] || undefined;
       const materialLinks = sanitiseLinks(links);
       const apiState = 'DRAFT';
@@ -2251,13 +2309,16 @@ async function uploadCourse() {
           payload.dueDate = {year:y,month:mo,day:d};
           payload.dueTime = {hours:h,minutes:mi,seconds:0,nanos:0};
         }
-        await api('POST', `${CLASSROOM}/courses/${courseId}/courseWork`, payload);
+        const res = await api('POST', `${CLASSROOM}/courses/${courseId}/courseWork`, payload);
+        undo.push(['courseWork', res.id]);
       } else if (type === 'MATERIAL') {
         const payload = { title, description:desc||'', state:apiState, materials:materialLinks };
         if (topicId) payload.topicId = topicId;
-        await api('POST', `${CLASSROOM}/courses/${courseId}/courseWorkMaterials`, payload);
+        const res = await api('POST', `${CLASSROOM}/courses/${courseId}/courseWorkMaterials`, payload);
+        undo.push(['courseWorkMaterials', res.id]);
       } else if (type === 'ANNOUNCEMENT') {
-        await api('POST', `${CLASSROOM}/courses/${courseId}/announcements`, { text: title+(desc?'\n\n'+desc:''), state:apiState });
+        const res = await api('POST', `${CLASSROOM}/courses/${courseId}/announcements`, { text: title+(desc?'\n\n'+desc:''), state:apiState });
+        undo.push(['announcements', res.id]);
       }
       created++;
     }
@@ -2288,12 +2349,14 @@ async function uploadCourse() {
     };
     const course = await api('POST', `${CLASSROOM}/courses`, coursePayload);
     courseId = course.id;
+    ctx.courseId = courseId; ctx.newCourse = true;
 
     showSpinner('Creating topics…');
     const topicIdMap = {};
     const topicRows = state.uploadPreview.filter(r => r[0] === 'TOPIC' && r[2]);
     await Promise.all(topicRows.map(async r => {
       const t = await api('POST', `${CLASSROOM}/courses/${courseId}/topics`, { name: r[2] });
+      undo.push(['topics', t.topicId]);
       topicIdMap[r[2]] = t.topicId;
     }));
 
@@ -2304,6 +2367,7 @@ async function uploadCourse() {
       const [type, topicName, title, desc, dueDate, dueTime, maxPts, links, rowState, schedDate, schedTime] = r;
       if (!title && type !== 'ANNOUNCEMENT') continue;
       showProgress(created + 1, workRows.length, 'Creating item');
+      ctx.current = title || type;
       const topicId = topicIdMap[topicName] || undefined;
       const materialLinks = sanitiseLinks(links);
       const apiState = rowState === 'PUBLISHED' ? 'PUBLISHED' : 'DRAFT';
@@ -2320,13 +2384,16 @@ async function uploadCourse() {
         if (schedDate && rowState === 'PUBLISHED') {
           payload.scheduledTime = toScheduledTime(schedDate, schedTime||'08:00');
         }
-        await api('POST', `${CLASSROOM}/courses/${courseId}/courseWork`, payload);
+        const res = await api('POST', `${CLASSROOM}/courses/${courseId}/courseWork`, payload);
+        undo.push(['courseWork', res.id]);
       } else if (type === 'MATERIAL') {
         const payload = { title, description:desc||'', state:apiState, materials:materialLinks };
         if (topicId) payload.topicId = topicId;
-        await api('POST', `${CLASSROOM}/courses/${courseId}/courseWorkMaterials`, payload);
+        const res = await api('POST', `${CLASSROOM}/courses/${courseId}/courseWorkMaterials`, payload);
+        undo.push(['courseWorkMaterials', res.id]);
       } else if (type === 'ANNOUNCEMENT') {
-        await api('POST', `${CLASSROOM}/courses/${courseId}/announcements`, { text: title+(desc?'\n\n'+desc:''), state:apiState });
+        const res = await api('POST', `${CLASSROOM}/courses/${courseId}/announcements`, { text: title+(desc?'\n\n'+desc:''), state:apiState });
+        undo.push(['announcements', res.id]);
       }
       created++;
     }
