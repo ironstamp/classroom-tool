@@ -899,7 +899,15 @@ function todayStr() {
   const d = new Date();
   return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
 }
-function sanitiseLinks(linksStr) {
+// Drive file id from a Drive/Docs URL, or null (folders and other URLs stay plain links)
+function driveFileId(url) {
+  let m = url.match(/^https?:\/\/drive\.google\.com\/(?:open|uc)\?(?:[^#]*&)?id=([\w-]{15,})/)
+       || url.match(/^https?:\/\/drive\.google\.com\/file\/d\/([\w-]{15,})/)
+       || url.match(/^https?:\/\/docs\.google\.com\/(?:document|spreadsheets|presentation|forms)\/d\/([\w-]{15,})/);
+  return m ? m[1] : null;
+}
+// asDrive=true turns Drive file URLs into real Drive attachments (proper preview); false = plain links
+function sanitiseLinks(linksStr, asDrive = false) {
   if (!linksStr) return [];
   return linksStr
     .split(/[,\n]/)
@@ -907,7 +915,20 @@ function sanitiseLinks(linksStr) {
     .map(s => s.replace(/^[^h]*(?=https?:\/\/)/, ''))
     .map(s => s.replace(/__[A-Z]+$/, ''))
     .filter(s => s.startsWith('http'))
-    .map(url => ({ link: { url } }));
+    .map(url => {
+      const id = asDrive ? driveFileId(url) : null;
+      return id ? { driveFile: { driveFile: { id }, shareMode: 'VIEW' } } : { link: { url } };
+    });
+}
+// Post with Drive attachments; if Classroom rejects them (no access, bad id), retry with plain links
+async function postWithFallback(url, payload, linksStr) {
+  try {
+    return await api('POST', url, payload);
+  } catch (e) {
+    if (!payload.materials.some(m => m.driveFile)) throw e;
+    console.warn('Drive attachment failed, retrying as plain links:', e);
+    return await api('POST', url, { ...payload, materials: sanitiseLinks(linksStr) });
+  }
 }
 const MAX_MATERIALS = 20; // Google Classroom allows at most 20 attachments per post
 function rowsOverLinkLimit(rows) {
@@ -2297,7 +2318,7 @@ async function uploadCourseRun(undo, ctx) {
       showProgress(created + 1, workRows.length, 'Creating item');
       ctx.current = title || type;
       const topicId = topicIdMap[topicName] || undefined;
-      const materialLinks = sanitiseLinks(links);
+      const materialLinks = sanitiseLinks(links, true);
       const apiState = 'DRAFT';
       if (type === 'ASSIGNMENT') {
         const payload = { title, description:desc||'', state:apiState, workType:'ASSIGNMENT', materials:materialLinks };
@@ -2309,12 +2330,12 @@ async function uploadCourseRun(undo, ctx) {
           payload.dueDate = {year:y,month:mo,day:d};
           payload.dueTime = {hours:h,minutes:mi,seconds:0,nanos:0};
         }
-        const res = await api('POST', `${CLASSROOM}/courses/${courseId}/courseWork`, payload);
+        const res = await postWithFallback(`${CLASSROOM}/courses/${courseId}/courseWork`, payload, links);
         undo.push(['courseWork', res.id]);
       } else if (type === 'MATERIAL') {
         const payload = { title, description:desc||'', state:apiState, materials:materialLinks };
         if (topicId) payload.topicId = topicId;
-        const res = await api('POST', `${CLASSROOM}/courses/${courseId}/courseWorkMaterials`, payload);
+        const res = await postWithFallback(`${CLASSROOM}/courses/${courseId}/courseWorkMaterials`, payload, links);
         undo.push(['courseWorkMaterials', res.id]);
       } else if (type === 'ANNOUNCEMENT') {
         const res = await api('POST', `${CLASSROOM}/courses/${courseId}/announcements`, { text: title+(desc?'\n\n'+desc:''), state:apiState });
@@ -2369,7 +2390,7 @@ async function uploadCourseRun(undo, ctx) {
       showProgress(created + 1, workRows.length, 'Creating item');
       ctx.current = title || type;
       const topicId = topicIdMap[topicName] || undefined;
-      const materialLinks = sanitiseLinks(links);
+      const materialLinks = sanitiseLinks(links, true);
       const apiState = rowState === 'PUBLISHED' ? 'PUBLISHED' : 'DRAFT';
       if (type === 'ASSIGNMENT') {
         const payload = { title, description:desc||'', state:apiState, workType:'ASSIGNMENT', materials:materialLinks };
@@ -2384,12 +2405,12 @@ async function uploadCourseRun(undo, ctx) {
         if (schedDate && rowState === 'PUBLISHED') {
           payload.scheduledTime = toScheduledTime(schedDate, schedTime||'08:00');
         }
-        const res = await api('POST', `${CLASSROOM}/courses/${courseId}/courseWork`, payload);
+        const res = await postWithFallback(`${CLASSROOM}/courses/${courseId}/courseWork`, payload, links);
         undo.push(['courseWork', res.id]);
       } else if (type === 'MATERIAL') {
         const payload = { title, description:desc||'', state:apiState, materials:materialLinks };
         if (topicId) payload.topicId = topicId;
-        const res = await api('POST', `${CLASSROOM}/courses/${courseId}/courseWorkMaterials`, payload);
+        const res = await postWithFallback(`${CLASSROOM}/courses/${courseId}/courseWorkMaterials`, payload, links);
         undo.push(['courseWorkMaterials', res.id]);
       } else if (type === 'ANNOUNCEMENT') {
         const res = await api('POST', `${CLASSROOM}/courses/${courseId}/announcements`, { text: title+(desc?'\n\n'+desc:''), state:apiState });
