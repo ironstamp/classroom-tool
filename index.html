@@ -703,10 +703,23 @@ body{font-family:'DM Sans',sans-serif;background:var(--grey-100);color:var(--tex
                 <div class="step">
                   <div class="step-num">1</div>
                   <div class="step-content">
-                    <div class="step-title">Choose your Google Sheet</div>
-                    <div style="display:flex;gap:8px;">
+                    <div class="step-title">Choose your source</div>
+                    <div style="display:flex;gap:8px;margin-bottom:10px;">
+                      <button id="ul-src-sheet" class="type-btn active" onclick="setUploadSource('sheet')">📄 Google Sheet</button>
+                      <button id="ul-src-folder" class="type-btn" onclick="setUploadSource('folder')">📁 Archive folder</button>
+                    </div>
+                    <div id="ul-src-sheet-panel" style="display:flex;gap:8px;">
                       <input type="text" id="ul-sheet-url" placeholder="Paste Google Sheets URL…" style="flex:1;padding:8px 11px;border:1.5px solid var(--grey-200);border-radius:var(--radius-sm);font-family:'DM Sans',sans-serif;font-size:13px;outline:none;" oninput="clearPreview()">
                       <button class="btn btn-ghost btn-sm" onclick="previewSheet()">Preview</button>
+                    </div>
+                    <div id="ul-src-folder-panel" style="display:none;">
+                      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+                        <button class="btn btn-ghost btn-sm" onclick="document.getElementById('ul-folder-input').click()">📁 Choose course folder…</button>
+                        <span id="ul-folder-name" style="font-size:12.5px;color:var(--text-muted);">No folder chosen</span>
+                        <input type="file" id="ul-folder-input" webkitdirectory directory multiple style="display:none" onchange="previewArchive(this)">
+                      </div>
+                      <label style="display:flex;align-items:center;gap:7px;font-size:13px;cursor:pointer;margin-top:10px;"><input type="checkbox" id="ul-convert" checked style="accent-color:var(--plum)"> Convert Word, Excel and PowerPoint files to Google Docs, Sheets and Slides</label>
+                      <div class="field-hint" style="margin-top:6px;">Pick the folder made by <strong>classroom_archive.py</strong> (the one containing <code>course_local.csv</code>). Its files are uploaded to a new folder in your Drive and attached to the right posts.</div>
                     </div>
                   </div>
                 </div>
@@ -754,7 +767,7 @@ body{font-family:'DM Sans',sans-serif;background:var(--grey-100);color:var(--tex
             <div class="card-footer">
               <div style="font-size:12px;color:var(--text-muted);">Items default to <strong>Draft</strong> unless scheduled dates exist in the sheet.</div>
               <div style="margin-left:auto;display:flex;gap:8px;">
-                <button class="btn btn-ghost" onclick="previewSheet()">Validate</button>
+                <button class="btn btn-ghost" onclick="previewUpload()">Validate</button>
                 <button class="btn btn-amber" id="ul-submit-btn" onclick="uploadCourse()">⬆️ Create Course</button>
               </div>
             </div>
@@ -977,6 +990,8 @@ const state = {
   scheduleMode: todaySchedule(),
   courseFilter: 'ACTIVE',
   uploadMode: 'new',
+  uploadSource: 'sheet', // 'sheet' | 'folder'
+  archive: null,         // { courseName, files: Map(relPath -> File), rows, plan, uploaded: Map(relPath -> driveId), folderId }
   drafts: [],
   selectedDraftIds: new Set(),
   draftTopicMap: {},
@@ -2188,7 +2203,200 @@ function extractSheetId(url) {
 
 function clearPreview() {
   state.uploadPreview = null;
-  document.getElementById('ul-preview-area').innerHTML = '<div class="empty-state">Paste a Sheet URL and click Preview →</div>';
+  const hint = state.uploadSource === 'folder' ? 'Choose a course folder →' : 'Paste a Sheet URL and click Preview →';
+  document.getElementById('ul-preview-area').innerHTML = `<div class="empty-state">${hint}</div>`;
+}
+
+// ═══════════════════════════════════════════
+// UPLOAD FROM ARCHIVE FOLDER (made by classroom_archive.py)
+// ═══════════════════════════════════════════
+function setUploadSource(src) {
+  state.uploadSource = src;
+  const isFolder = src === 'folder';
+  document.getElementById('ul-src-sheet').classList.toggle('active', !isFolder);
+  document.getElementById('ul-src-folder').classList.toggle('active', isFolder);
+  document.getElementById('ul-src-sheet-panel').style.display = isFolder ? 'none' : 'flex';
+  document.getElementById('ul-src-folder-panel').style.display = isFolder ? '' : 'none';
+  if (isFolder && state.archive) renderArchivePreview(); else clearPreview();
+}
+
+function previewUpload() {
+  if (state.uploadSource !== 'folder') return previewSheet();
+  if (!state.archive) { toast('Choose a course folder first', 'error'); return; }
+  renderArchivePreview();
+}
+
+// RFC 4180 CSV parser (quoted fields, embedded commas and newlines, BOM)
+function parseCsv(text) {
+  text = text.replace(/^\uFEFF/, '');
+  const rows = []; let row = [], field = '', i = 0, q = false;
+  while (i < text.length) {
+    const c = text[i];
+    if (q) {
+      if (c === '"') { if (text[i + 1] === '"') { field += '"'; i += 2; continue; } q = false; i++; continue; }
+      field += c; i++; continue;
+    }
+    if (c === '"') { q = true; i++; continue; }
+    if (c === ',') { row.push(field); field = ''; i++; continue; }
+    if (c === '\r') { i++; continue; }
+    if (c === '\n') { row.push(field); rows.push(row); row = []; field = ''; i++; continue; }
+    field += c; i++;
+  }
+  if (field !== '' || row.length) { row.push(field); rows.push(row); }
+  return rows;
+}
+
+const nfc = s => (s || '').normalize('NFC');
+
+// Split a LINKS cell into web URLs and local archive paths. Local file names can
+// themselves contain ", " so neighbouring pieces are re-joined until they match a real file.
+function resolveArchiveLinks(cell, files, dirs) {
+  const toks = (cell || '').split(', ').map(t => t.trim()).filter(Boolean);
+  const out = [], missing = [];
+  for (let i = 0; i < toks.length; i++) {
+    if (/^https?:\/\//.test(toks[i])) { out.push({ url: toks[i] }); continue; }
+    let cur = toks[i], j = i;
+    const known = p => files.has(nfc(p)) || dirs.has(nfc(p));
+    while (!known(cur) && j + 1 < toks.length && !/^https?:\/\//.test(toks[j + 1])) { j++; cur += ', ' + toks[j]; }
+    if (known(cur)) {
+      const p = nfc(cur);
+      const paths = files.has(p) ? [p] : [...files.keys()].filter(k => k.startsWith(p + '/')).sort();
+      out.push({ paths });
+      i = j;
+    } else {
+      missing.push(toks[i]);
+    }
+  }
+  return { out, missing };
+}
+
+async function previewArchive(input) {
+  const all = [...(input.files || [])];
+  input.value = '';
+  if (!all.length) return;
+  const csvFile = all.filter(f => /(^|\/)course_local\.csv$/.test(f.webkitRelativePath))
+                     .sort((a, b) => a.webkitRelativePath.length - b.webkitRelativePath.length)[0];
+  if (!csvFile) { toast('No course_local.csv in that folder - choose the course folder made by classroom_archive.py', 'error', 8000); return; }
+  const base = csvFile.webkitRelativePath.slice(0, -'course_local.csv'.length);
+  const files = new Map(), dirs = new Set();
+  all.forEach(f => {
+    if (!f.webkitRelativePath.startsWith(base)) return;
+    const rel = nfc(f.webkitRelativePath.slice(base.length));
+    if (!rel.startsWith('files/') || /(^|\/)(_description\.txt|LINKS\.txt|\.DS_Store)$/.test(rel)) return;
+    files.set(rel, f);
+    const parts = rel.split('/');
+    for (let k = 1; k < parts.length; k++) dirs.add(parts.slice(0, k).join('/'));
+  });
+
+  const table = parseCsv(await csvFile.text());
+  const rows = table.slice(1).filter(r => r[0]).map(r => { const x = r.slice(0, 11); while (x.length < 11) x.push(''); return x; });
+  const plan = rows.map(r => ['ASSIGNMENT', 'MATERIAL'].includes(r[0]) ? resolveArchiveLinks(r[7], files, dirs) : { out: [], missing: [] });
+  const courseRow = rows.find(r => r[0] === 'COURSE');
+  state.archive = { courseName: courseRow?.[2] || base.replace(/\/$/, '') || 'Course', files, rows, plan,
+                    uploaded: new Map(), folderId: null };
+  document.getElementById('ul-folder-name').textContent = base.replace(/\/$/, '') || csvFile.name;
+  if (courseRow?.[2]) document.getElementById('ul-name').placeholder = courseRow[2] + ' (copy)';
+  renderArchivePreview();
+}
+
+function renderArchivePreview() {
+  const a = state.archive;
+  const counts = { TOPIC: 0, ASSIGNMENT: 0, MATERIAL: 0, ANNOUNCEMENT: 0 };
+  a.rows.forEach(r => { if (counts[r[0]] !== undefined) counts[r[0]]++; });
+  const used = new Set(); let links = 0;
+  const missing = [], over = [];
+  a.plan.forEach((p, i) => {
+    let n = 0;
+    p.out.forEach(o => { if (o.url) { links++; n++; } else { o.paths.forEach(x => used.add(x)); n += o.paths.length; } });
+    p.missing.forEach(m => missing.push({ title: a.rows[i][2], path: m }));
+    if (n > MAX_MATERIALS) over.push({ title: a.rows[i][2] || '(untitled)', n });
+  });
+  const bytes = [...used].reduce((t, k) => t + (a.files.get(k)?.size || 0), 0);
+  const mb = (bytes / 1048576).toFixed(1);
+  state.uploadPreview = over.length ? null : a.rows; // gate the upload button
+
+  const warn = (html) => `<div style="background:#FDECEA;border:1.5px solid #E57373;color:#B71C1C;border-radius:8px;padding:10px 12px;margin-bottom:12px;font-size:12.5px;line-height:1.5;">${html}</div>`;
+  let extra = '';
+  if (over.length) extra += warn(`<strong>⚠️ Too many attachments - upload is blocked.</strong> Classroom allows at most ${MAX_MATERIALS} per post:<ul style="margin:6px 0 0 18px;padding:0;">${over.map(x => `<li>${escHtml(x.title)} - ${x.n}</li>`).join('')}</ul>`);
+  if (missing.length) extra += warn(`<strong>${missing.length} file(s) listed in course_local.csv aren't in the folder</strong> - those posts will be created without them:<ul style="margin:6px 0 0 18px;padding:0;">${missing.slice(0, 8).map(x => `<li>${escHtml(x.title)}: ${escHtml(x.path)}</li>`).join('')}${missing.length > 8 ? `<li>…and ${missing.length - 8} more</li>` : ''}</ul>`);
+
+  document.getElementById('ul-preview-area').innerHTML = extra + `
+    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px;">
+      <span class="tag" style="background:var(--plum-pale);color:var(--plum-dark);">📂 ${counts.TOPIC} topics</span>
+      <span class="tag" style="background:#E3F2FD;color:#1565C0;">📝 ${counts.ASSIGNMENT} assignments</span>
+      <span class="tag" style="background:var(--green-pale);color:var(--green);">📄 ${counts.MATERIAL} materials</span>
+      <span class="tag" style="background:var(--amber-pale);color:#7A4E00;">📎 ${used.size} files to upload (${mb} MB)</span>
+      <span class="tag" style="background:var(--grey-100);color:var(--text-muted);">🔗 ${links} web links</span>
+    </div>
+    <table class="preview-table">
+      <thead><tr><th>Type</th><th>Topic</th><th>Title</th><th>Files</th></tr></thead>
+      <tbody>${a.rows.slice(0, 20).map((r, i) => `
+        <tr>
+          <td><span class="type-badge badge-${r[0].toLowerCase()}">${r[0]}</span></td>
+          <td style="color:var(--text-muted)">${escHtml(r[1] || '')}</td>
+          <td>${escHtml((r[2] || '').substring(0, 50))}${(r[2] || '').length > 50 ? '…' : ''}</td>
+          <td style="color:var(--text-muted);font-size:11.5px">${a.plan[i].out.reduce((t, o) => t + (o.paths ? o.paths.length : 0), 0) || ''}</td>
+        </tr>`).join('')}
+      </tbody>
+    </table>
+    ${a.rows.length > 20 ? `<div style="font-size:12px;color:var(--text-muted);margin-top:8px;text-align:right;">Showing 20 of ${a.rows.length} rows</div>` : ''}`;
+  if (over.length) toast(`${over.length} post(s) have more than ${MAX_MATERIALS} attachments - fix before uploading`, 'error', 8000);
+  else toast(`Found ${a.rows.length} rows and ${used.size} files`, 'info');
+}
+
+const GOOGLE_TYPES = {
+  docx: 'application/vnd.google-apps.document', doc: 'application/vnd.google-apps.document',
+  xlsx: 'application/vnd.google-apps.spreadsheet', xls: 'application/vnd.google-apps.spreadsheet',
+  pptx: 'application/vnd.google-apps.presentation', ppt: 'application/vnd.google-apps.presentation',
+};
+
+async function uploadFileToDrive(file, parentId, convert) {
+  if (state.tokenExpiry && Date.now() > state.tokenExpiry - 60000) {
+    throw new Error('your Google sign-in has expired - sign out and in again, then click Create Course again to resume');
+  }
+  const ext = (file.name.split('.').pop() || '').toLowerCase();
+  const target = convert ? GOOGLE_TYPES[ext] : null;
+  const meta = { name: target ? file.name.replace(/\.[^.]+$/, '') : file.name, parents: [parentId] };
+  if (target) meta.mimeType = target;
+  const type = file.type || 'application/octet-stream';
+  const init = await fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable', {
+    method: 'POST',
+    headers: { 'Authorization': `Bearer ${state.accessToken}`, 'Content-Type': 'application/json',
+               'X-Upload-Content-Type': type, 'X-Upload-Content-Length': file.size },
+    body: JSON.stringify(meta),
+  });
+  if (!init.ok) throw new Error(`could not start upload of ${file.name} (${init.status})`);
+  const put = await fetch(init.headers.get('Location'), { method: 'PUT', headers: { 'Content-Type': type }, body: file });
+  if (!put.ok) throw new Error(`upload of ${file.name} failed (${put.status})`);
+  return (await put.json()).id;
+}
+
+// Upload every local file the course needs, then hand uploadCourseRun rows whose
+// LINKS point at the new Drive files. Uploaded ids are remembered, so a retry resumes.
+async function prepareArchiveUploads() {
+  const a = state.archive;
+  const convert = document.getElementById('ul-convert').checked;
+  const needed = [...new Set(a.plan.flatMap(p => p.out.flatMap(o => o.paths || [])))].filter(k => !a.uploaded.has(k));
+  if (needed.length) {
+    if (!a.folderId) {
+      showSpinner('Creating Drive folder…');
+      const name = (document.getElementById('ul-name').value.trim() || a.courseName) + ' - course files';
+      const f = await api('POST', `${DRIVE}/files`, { name, mimeType: 'application/vnd.google-apps.folder' });
+      a.folderId = f.id;
+    }
+    for (let i = 0; i < needed.length; i++) {
+      const file = a.files.get(needed[i]);
+      showSpinner(`Uploading files to Drive… ${i + 1} of ${needed.length}`);
+      showProgress(i + 1, needed.length, 'Uploading file');
+      a.uploaded.set(needed[i], await uploadFileToDrive(file, a.folderId, convert));
+    }
+  }
+  state.uploadPreview = a.rows.map((r, i) => {
+    if (!['ASSIGNMENT', 'MATERIAL'].includes(r[0])) return r;
+    const urls = a.plan[i].out.flatMap(o => o.url ? [o.url]
+      : o.paths.map(p => `https://drive.google.com/file/d/${a.uploaded.get(p)}/view`));
+    const x = r.slice(); x[7] = urls.join(', '); return x;
+  });
 }
 
 async function previewSheet() {
@@ -2250,6 +2458,18 @@ async function previewSheet() {
 }
 
 async function uploadCourse() {
+  if (state.uploadSource === 'folder') {
+    if (!state.archive) { toast('Choose a course folder first', 'error'); return; }
+    if (state.uploadMode === 'new' && !document.getElementById('ul-name').value.trim()) { toast('Enter a course name', 'error'); return; }
+    if (state.uploadMode === 'existing' && !document.getElementById('ul-existing-course').value) { toast('Select an existing course', 'error'); return; }
+    try {
+      await prepareArchiveUploads();
+    } catch (e) {
+      hideSpinner();
+      toast(`File upload stopped: ${escHtml(e.message)}. Nothing was added to Classroom. Files already uploaded are in your Drive folder and will be reused if you try again.`, 'error', 15000);
+      return;
+    }
+  }
   if (!state.uploadPreview) { toast('Preview the sheet first', 'error'); return; }
   const over = rowsOverLinkLimit(state.uploadPreview);
   if (over.length) {
