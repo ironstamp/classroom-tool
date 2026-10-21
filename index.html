@@ -757,6 +757,7 @@ body{font-family:'DM Sans',sans-serif;background:var(--grey-100);color:var(--tex
                   <div class="step-num">3</div>
                   <div class="step-content">
                     <div class="step-title">Preview</div>
+                    <div id="ul-result"></div>
                     <div id="ul-preview-area" style="background:var(--grey-100);border-radius:var(--radius-sm);border:1.5px solid var(--grey-200);padding:14px;min-height:80px;">
                       <div class="empty-state">Paste a Sheet URL and click Preview →</div>
                     </div>
@@ -2363,7 +2364,7 @@ const GOOGLE_TYPES = {
   pptx: 'application/vnd.google-apps.presentation', ppt: 'application/vnd.google-apps.presentation',
 };
 
-async function uploadFileToDrive(file, parentId, convert) {
+async function uploadFileToDrive(file, parentId, convert, relPath) {
   if (state.tokenExpiry && Date.now() > state.tokenExpiry - 60000) {
     throw new Error('your Google sign-in has expired - sign out and in again, then click Create Course again to resume');
   }
@@ -2371,6 +2372,7 @@ async function uploadFileToDrive(file, parentId, convert) {
   const target = convert ? GOOGLE_TYPES[ext] : null;
   const meta = { name: target ? file.name.replace(/\.[^.]+$/, '') : file.name, parents: [parentId] };
   if (target) meta.mimeType = target;
+  if (relPath) meta.appProperties = { archivePath: shortHash(relPath) };   // lets a later attempt recognise it
   const type = file.type || 'application/octet-stream';
   const init = await fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable', {
     method: 'POST',
@@ -2384,24 +2386,96 @@ async function uploadFileToDrive(file, parentId, convert) {
   return (await put.json()).id;
 }
 
+// A result box under "Preview" that stays until the next upload, so the outcome can't be missed.
+function showUploadResult(ok, html) {
+  const el = document.getElementById('ul-result');
+  if (!el) return;
+  el.innerHTML = html ? `<div style="background:${ok ? 'var(--green-pale)' : '#FDECEA'};border:1.5px solid ${ok ? 'var(--green)' : '#E57373'};color:${ok ? 'var(--green)' : '#B71C1C'};border-radius:8px;padding:10px 12px;margin-bottom:12px;font-size:13px;line-height:1.5;">${html}</div>` : '';
+}
+
+// Short stable fingerprint (fits Drive's appProperties size limit)
+function shortHash(str) {
+  let h1 = 0x811c9dc5, h2 = 0x01000193;
+  for (let i = 0; i < str.length; i++) {
+    const c = str.charCodeAt(i);
+    h1 = Math.imul(h1 ^ c, 16777619) >>> 0;
+    h2 = Math.imul(h2 ^ c, 2246822519) >>> 0;
+  }
+  return h1.toString(16).padStart(8, '0') + h2.toString(16).padStart(8, '0');
+}
+const qEsc = s => s.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+
+// Find the Drive folder from an earlier attempt at this course (tagged, or by its usual name)
+async function findArchiveFolder(a, name) {
+  const names = [...new Set([name, a.courseName + ' - course files'])];
+  const q = `mimeType='application/vnd.google-apps.folder' and trashed=false and (`
+    + `appProperties has { key='archiveCourse' and value='${shortHash(a.courseName)}' }`
+    + names.map(n => ` or name='${qEsc(n)}'`).join('') + ')';
+  const res = await api('GET', `${DRIVE}/files?q=${encodeURIComponent(q)}&orderBy=createdTime desc&pageSize=10&fields=files(id,name,appProperties)`);
+  const files = res.files || [];
+  return files.find(f => f.appProperties?.archiveCourse === shortHash(a.courseName)) || files[0] || null;
+}
+
+// Match local files to files already in that folder: by tag first, then by unique file name
+async function matchExistingUploads(a, folderId, needed) {
+  const existing = []; let pageToken = '';
+  do {
+    const q = `'${folderId}' in parents and trashed=false`;
+    const res = await api('GET', `${DRIVE}/files?q=${encodeURIComponent(q)}&pageSize=1000&fields=nextPageToken,files(id,name,appProperties)` + (pageToken ? `&pageToken=${pageToken}` : ''));
+    existing.push(...(res.files || []));
+    pageToken = res.nextPageToken || '';
+  } while (pageToken);
+  const byTag = new Map(existing.filter(f => f.appProperties?.archivePath).map(f => [f.appProperties.archivePath, f.id]));
+  const untagged = existing.filter(f => !f.appProperties?.archivePath);
+  const countBy = (arr) => arr.reduce((m, k) => m.set(k, (m.get(k) || 0) + 1), new Map());
+  const driveNames = countBy(untagged.map(f => nfc(f.name)));
+  const baseName = p => p.split('/').pop();
+  const localNames = countBy(needed.map(p => baseName(p)));
+  let found = 0;
+  for (const p of needed) {
+    const tagged = byTag.get(shortHash(p));
+    if (tagged) { a.uploaded.set(p, tagged); found++; continue; }
+    const n = baseName(p), stripped = n.replace(/\.[^.]+$/, '');
+    if (localNames.get(n) !== 1) continue;                       // ambiguous locally
+    for (const cand of [n, stripped]) {
+      if (driveNames.get(cand) === 1) {
+        const f = untagged.find(x => nfc(x.name) === cand);
+        a.uploaded.set(p, f.id); found++; break;
+      }
+    }
+  }
+  return found;
+}
+
 // Upload every local file the course needs, then hand uploadCourseRun rows whose
 // LINKS point at the new Drive files. Uploaded ids are remembered, so a retry resumes.
 async function prepareArchiveUploads() {
   const a = state.archive;
   const convert = document.getElementById('ul-convert').checked;
-  const needed = [...new Set(a.plan.flatMap(p => p.out.flatMap(o => o.paths || [])))].filter(k => !a.uploaded.has(k));
+  let needed = [...new Set(a.plan.flatMap(p => p.out.flatMap(o => o.paths || [])))].filter(k => !a.uploaded.has(k));
   if (needed.length) {
+    const name = (document.getElementById('ul-name').value.trim() || a.courseName) + ' - course files';
+    if (!a.folderId) {
+      showSpinner('Checking Drive for files from an earlier attempt…');
+      const prev = await findArchiveFolder(a, name);
+      if (prev) {
+        a.folderId = prev.id;
+        const found = await matchExistingUploads(a, prev.id, needed);
+        needed = needed.filter(k => !a.uploaded.has(k));
+        if (found) toast(`Found ${found} file(s) already in Drive from an earlier attempt - skipping those`, 'info', 6000);
+      }
+    }
     if (!a.folderId) {
       showSpinner('Creating Drive folder…');
-      const name = (document.getElementById('ul-name').value.trim() || a.courseName) + ' - course files';
-      const f = await api('POST', `${DRIVE}/files`, { name, mimeType: 'application/vnd.google-apps.folder' });
+      const f = await api('POST', `${DRIVE}/files`, { name, mimeType: 'application/vnd.google-apps.folder',
+                                                     appProperties: { archiveCourse: shortHash(a.courseName) } });
       a.folderId = f.id;
     }
     for (let i = 0; i < needed.length; i++) {
       const file = a.files.get(needed[i]);
       showSpinner(`Uploading files to Drive… ${i + 1} of ${needed.length}`);
       showProgress(i + 1, needed.length, 'Uploading file');
-      a.uploaded.set(needed[i], await uploadFileToDrive(file, a.folderId, convert));
+      a.uploaded.set(needed[i], await uploadFileToDrive(file, a.folderId, convert, needed[i]));
     }
   }
   state.uploadPreview = a.rows.map((r, i) => {
@@ -2475,10 +2549,12 @@ async function uploadCourse() {
     if (!state.archive) { toast('Choose a course folder first', 'error'); return; }
     if (state.uploadMode === 'new' && !document.getElementById('ul-name').value.trim()) { toast('Enter a course name', 'error'); return; }
     if (state.uploadMode === 'existing' && !document.getElementById('ul-existing-course').value) { toast('Select an existing course', 'error'); return; }
+    showUploadResult(true, '');
     try {
       await prepareArchiveUploads();
     } catch (e) {
       hideSpinner();
+      showUploadResult(false, `<strong>File upload stopped:</strong> ${escHtml(e.message)}<br>Nothing was added to Classroom. Click the button again to carry on - files already in Drive won't be uploaded twice.`);
       toast(`File upload stopped: ${escHtml(e.message)}. Nothing was added to Classroom. Files already uploaded are in your Drive folder and will be reused if you try again.`, 'error', 15000);
       return;
     }
@@ -2522,6 +2598,8 @@ async function rollbackUpload(undo, ctx, err) {
   hideSpinner();
   try { await loadAllCourses(); } catch (_) {}
   toast(`Upload failed${ctx.current ? ` at "${escHtml(ctx.current)}"` : ''}: ${escHtml(err.message)}. ${how}`, 'error', 15000);
+  showUploadResult(false, `<strong>Upload failed${ctx.current ? ` at "${escHtml(ctx.current)}"` : ''}:</strong> ${escHtml(err.message)}<br>${how}`
+    + (state.uploadSource === 'folder' ? '<br>Files already uploaded to Drive will be reused when you try again.' : ''));
 }
 
 async function uploadCourseRun(undo, ctx) {
@@ -2599,6 +2677,8 @@ async function uploadCourseRun(undo, ctx) {
     renderRecentUploads();
     hideSpinner();
     toast(`✅ Added ${created} items to ${courseName}!` + (keepOriginal() ? (ctx.dropped ? ` ${ctx.dropped} past date(s) were left off.` : '') : ' All items are drafts with no due dates.'), 'success', 10000);
+    showUploadResult(true, `<strong>✅ Added ${created} items to ${escHtml(courseName)}.</strong>` + (keepOriginal() ? '' : ' Everything is a draft with no due dates.')
+      + (courseLink ? ` <a href="${courseLink}" target="_blank" style="color:inherit;font-weight:600;">Open in Classroom →</a>` : ''));
     if (courseLink) setTimeout(() => toast(`<a href="${courseLink}" target="_blank" style="color:white;font-weight:600;">Open course in Classroom →</a>`, 'info', 8000), 800);
     document.getElementById('ul-sheet-url').value = '';
     clearPreview();
@@ -2683,6 +2763,8 @@ async function uploadCourseRun(undo, ctx) {
     await loadAllCourses();
     hideSpinner();
     toast(`✅ Course created with ${created} items!` + (keepOriginal() ? (ctx.dropped ? ` ${ctx.dropped} past date(s) were left off.` : '') : ' All items are drafts with no due dates.'), 'success', 10000);
+    showUploadResult(true, `<strong>✅ Course "${escHtml(name)}" created with ${created} items.</strong>` + (keepOriginal() ? '' : ' Everything is a draft with no due dates.')
+      + (course.alternateLink ? ` <a href="${course.alternateLink}" target="_blank" style="color:inherit;font-weight:600;">Open in Classroom →</a>` : ''));
     if (course.alternateLink) setTimeout(() => toast(`<a href="${course.alternateLink}" target="_blank" style="color:white;font-weight:600;">Open course in Classroom →</a>`, 'info', 8000), 800);
     document.getElementById('ul-sheet-url').value = '';
     document.getElementById('ul-name').value = '';
