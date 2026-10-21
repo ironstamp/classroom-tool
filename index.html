@@ -906,6 +906,18 @@ function driveFileId(url) {
        || url.match(/^https?:\/\/docs\.google\.com\/(?:document|spreadsheets|presentation|forms)\/d\/([\w-]{15,})/);
   return m ? m[1] : null;
 }
+// Turn a post's Classroom materials into the comma-separated LINKS cell.
+// Covers every attachment type: Drive files, plain links, YouTube videos and Google Forms.
+function materialLinksStr(materials) {
+  return (materials || []).map(m =>
+    m.driveFile?.driveFile?.alternateLink
+    || m.link?.url
+    || m.youtubeVideo?.alternateLink
+    || (m.youtubeVideo?.id ? `https://www.youtube.com/watch?v=${m.youtubeVideo.id}` : '')
+    || m.form?.formUrl
+    || ''
+  ).filter(Boolean).join(', ');
+}
 // asDrive=true turns Drive file URLs into real Drive attachments (proper preview); false = plain links
 function sanitiseLinks(linksStr, asDrive = false) {
   if (!linksStr) return [];
@@ -2067,7 +2079,7 @@ async function downloadCourse(templateOnly = false) {
 
     coursework.forEach(cw => {
       const topic = topicMap[cw.topicId] || '';
-      const links = (cw.materials||[]).map(m => m.link?.url || m.driveFile?.driveFile?.alternateLink || '').filter(Boolean).join(', ');
+      const links = materialLinksStr(cw.materials);
       const dueDate = cw.dueDate ? `${cw.dueDate.year}-${String(cw.dueDate.month).padStart(2,'0')}-${String(cw.dueDate.day).padStart(2,'0')}` : '';
       const dueTime = cw.dueTime ? `${String(cw.dueTime.hours||0).padStart(2,'0')}:${String(cw.dueTime.minutes||0).padStart(2,'0')}` : '';
       const schedDt = cw.scheduledTime ? cw.scheduledTime.split('T') : ['',''];
@@ -2082,7 +2094,7 @@ async function downloadCourse(templateOnly = false) {
     if (incMats) {
       materials.forEach(m => {
         const topic = topicMap[m.topicId] || '';
-        const links = (m.materials||[]).map(mat => mat.link?.url || mat.driveFile?.driveFile?.alternateLink || '').filter(Boolean).join(', ');
+        const links = materialLinksStr(m.materials);
         allItems.push({
           topicId: m.topicId || '__none__',
           topicIndex: topicIndexMap[m.topicId] ?? 9999,
