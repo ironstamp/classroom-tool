@@ -699,6 +699,7 @@ body{font-family:'DM Sans',sans-serif;background:var(--grey-100);color:var(--tex
                   <button id="ul-mode-new" class="type-btn active" onclick="setUploadMode('new')">🆕 New course</button>
                   <button id="ul-mode-existing" class="type-btn" onclick="setUploadMode('existing')">➕ Add to existing course</button>
                 </div>
+                <label style="display:flex;align-items:center;gap:7px;font-size:13px;cursor:pointer;margin-top:-8px;"><input type="checkbox" id="ul-drop-past" checked style="accent-color:var(--plum)"> Leave off due dates and schedules that have already passed <span style="color:var(--text-muted);font-size:12px;">(Classroom won't accept them)</span></label>
 
                 <div class="step">
                   <div class="step-num">1</div>
@@ -969,6 +970,17 @@ function toScheduledTime(dateStr, timeStr) {
   const hh = String(Math.floor(abs / 60)).padStart(2, '0');
   const mm = String(abs % 60).padStart(2, '0');
   return `${dateStr}T${timeStr}:00${sign}${hh}:${mm}`;
+}
+// Classroom rejects due dates and scheduled times that have already passed.
+// When "drop past dates" is ticked these return false, so the item is created without them.
+function dropPastDates() { return document.getElementById('ul-drop-past')?.checked !== false; }
+function isPastDue(dueDate, dueTime) {
+  const [y, mo, d] = dueDate.split('-').map(Number);
+  const [h, mi] = (dueTime || '23:59').split(':').map(Number);
+  return Date.UTC(y, mo - 1, d, h, mi) <= Date.now();   // Classroom due times are UTC
+}
+function isPastLocal(dateStr, timeStr) {
+  return new Date(`${dateStr}T${timeStr || '08:00'}:00`).getTime() <= Date.now();
 }
 
 // ═══════════════════════════════════════════
@@ -2556,7 +2568,9 @@ async function uploadCourseRun(undo, ctx) {
         const payload = { title, description:desc||'', state:apiState, workType:'ASSIGNMENT', materials:materialLinks };
         if (topicId) payload.topicId = topicId;
         if (maxPts) payload.maxPoints = parseInt(maxPts)||0;
-        if (dueDate) {
+        if (dueDate && dropPastDates() && isPastDue(dueDate, dueTime)) {
+          ctx.dropped = (ctx.dropped || 0) + 1;
+        } else if (dueDate) {
           const [y,mo,d] = dueDate.split('-').map(Number);
           const [h,mi] = (dueTime||'23:59').split(':').map(Number);
           payload.dueDate = {year:y,month:mo,day:d};
@@ -2581,7 +2595,7 @@ async function uploadCourseRun(undo, ctx) {
     localStorage.setItem('cm_recent_uploads', JSON.stringify(state.recentUploads));
     renderRecentUploads();
     hideSpinner();
-    toast(`✅ Added ${created} items to ${courseName}!`, 'success', 8000);
+    toast(`✅ Added ${created} items to ${courseName}!` + (ctx.dropped ? ` ${ctx.dropped} past due date(s) were left off - set new ones in Classroom.` : ''), 'success', 10000);
     if (courseLink) setTimeout(() => toast(`<a href="${courseLink}" target="_blank" style="color:white;font-weight:600;">Open course in Classroom →</a>`, 'info', 8000), 800);
     document.getElementById('ul-sheet-url').value = '';
     clearPreview();
@@ -2628,13 +2642,17 @@ async function uploadCourseRun(undo, ctx) {
         const payload = { title, description:desc||'', state:apiState, workType:'ASSIGNMENT', materials:materialLinks };
         if (topicId) payload.topicId = topicId;
         if (maxPts) payload.maxPoints = parseInt(maxPts)||0;
-        if (dueDate) {
+        if (dueDate && dropPastDates() && isPastDue(dueDate, dueTime)) {
+          ctx.dropped = (ctx.dropped || 0) + 1;
+        } else if (dueDate) {
           const [y,mo,d] = dueDate.split('-').map(Number);
           const [h,mi] = (dueTime||'23:59').split(':').map(Number);
           payload.dueDate = {year:y,month:mo,day:d};
           payload.dueTime = {hours:h,minutes:mi,seconds:0,nanos:0};
         }
-        if (schedDate && rowState === 'PUBLISHED') {
+        if (schedDate && rowState === 'PUBLISHED' && dropPastDates() && isPastLocal(schedDate, schedTime)) {
+          ctx.dropped = (ctx.dropped || 0) + 1;
+        } else if (schedDate && rowState === 'PUBLISHED') {
           payload.scheduledTime = toScheduledTime(schedDate, schedTime||'08:00');
         }
         const res = await postWithFallback(`${CLASSROOM}/courses/${courseId}/courseWork`, payload, links);
@@ -2657,7 +2675,7 @@ async function uploadCourseRun(undo, ctx) {
     renderRecentUploads();
     await loadAllCourses();
     hideSpinner();
-    toast(`✅ Course created with ${created} items!`, 'success', 8000);
+    toast(`✅ Course created with ${created} items!` + (ctx.dropped ? ` ${ctx.dropped} past due date(s) were left off - set new ones in Classroom.` : ''), 'success', 10000);
     if (course.alternateLink) setTimeout(() => toast(`<a href="${course.alternateLink}" target="_blank" style="color:white;font-weight:600;">Open course in Classroom →</a>`, 'info', 8000), 800);
     document.getElementById('ul-sheet-url').value = '';
     document.getElementById('ul-name').value = '';
