@@ -2671,7 +2671,7 @@ async function uploadCourseRun(undo, ctx) {
       created++;
     }
 
-    state.recentUploads.unshift({ name: `${courseName} (+${created} items)`, courseId, created: new Date().toLocaleDateString('en-NZ'), items: created });
+    state.recentUploads.unshift({ name: `${courseName} (+${created} items)`, courseId, link: courseLink || '', created: new Date().toLocaleDateString('en-NZ'), items: created });
     if (state.recentUploads.length > 5) state.recentUploads.pop();
     localStorage.setItem('cm_recent_uploads', JSON.stringify(state.recentUploads));
     renderRecentUploads();
@@ -2756,14 +2756,28 @@ async function uploadCourseRun(undo, ctx) {
       created++;
     }
 
-    state.recentUploads.unshift({ name, courseId, created: new Date().toLocaleDateString('en-NZ'), items: created });
+    state.recentUploads.unshift({ name, courseId, link: course.alternateLink || '', created: new Date().toLocaleDateString('en-NZ'), items: created });
     if (state.recentUploads.length > 5) state.recentUploads.pop();
     localStorage.setItem('cm_recent_uploads', JSON.stringify(state.recentUploads));
     renderRecentUploads();
+
+    // New courses are built while "provisioned" (pending) so a half-made class never shows up.
+    // Accept it now so it appears in Classroom like any other class.
+    let activated = false;
+    showSpinner('Activating course…');
+    try {
+      await api('PATCH', `${CLASSROOM}/courses/${courseId}?updateMask=courseState`, { courseState: 'ACTIVE' });
+      activated = true;
+    } catch (e) {
+      console.warn('Could not activate course:', e);
+    }
+
     await loadAllCourses();
     hideSpinner();
     toast(`✅ Course created with ${created} items!` + (keepOriginal() ? (ctx.dropped ? ` ${ctx.dropped} past date(s) were left off.` : '') : ' All items are drafts with no due dates.'), 'success', 10000);
     showUploadResult(true, `<strong>✅ Course "${escHtml(name)}" created with ${created} items.</strong>` + (keepOriginal() ? '' : ' Everything is a draft with no due dates.')
+      + (activated ? ' It\'s now in your Classroom class list.'
+                   : '<br>⚠️ Classroom didn\'t let the tool accept it automatically, so it won\'t appear in your class list yet - open it with the link and click <strong>Accept</strong>.')
       + (course.alternateLink ? ` <a href="${course.alternateLink}" target="_blank" style="color:inherit;font-weight:600;">Open in Classroom →</a>` : ''));
     if (course.alternateLink) setTimeout(() => toast(`<a href="${course.alternateLink}" target="_blank" style="color:white;font-weight:600;">Open course in Classroom →</a>`, 'info', 8000), 800);
     document.getElementById('ul-sheet-url').value = '';
@@ -2779,7 +2793,7 @@ function renderRecentUploads() {
   }
   el.innerHTML = state.recentUploads.map(u => `
     <div style="padding:9px 12px;border:1px solid var(--grey-200);border-radius:var(--radius-sm);font-size:12.5px;margin-bottom:7px;">
-      <div style="font-weight:600;color:var(--plum-dark);">${escHtml(u.name)}</div>
+      <div style="font-weight:600;color:var(--plum-dark);">${u.link ? `<a href="${u.link}" target="_blank" class="link">${escHtml(u.name)} ↗</a>` : escHtml(u.name)}</div>
       <div style="color:var(--text-muted);margin-top:1px;">Created ${u.created} · ${u.items} items</div>
     </div>
   `).join('');
