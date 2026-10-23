@@ -64,7 +64,7 @@ Row 1 is the header. Each following row is one item, and `TOPIC` rows group the 
 
 #### Uploading from an archive folder
 
-If you've used `classroom_archive.py` (from the drive-backup scripts) to download a course's attachments to your computer, choose **Archive folder** as the source and pick the folder containing `course_local.csv`. The files are uploaded to a new folder in your Drive and attached to the right posts. Word, Excel and PowerPoint files can be converted to Google Docs, Sheets and Slides on the way in.
+If you've used [`classroom_archive.py`](https://github.com/ironstamp/drive-backup/blob/main/docs/classroom-archive.md) (from the drive-backup scripts) to download a course's attachments to your computer, choose **Archive folder** as the source and pick the folder containing `course_local.csv`. The files are uploaded to a new folder in your Drive and attached to the right posts. Word, Excel and PowerPoint files can be converted to Google Docs, Sheets and Slides on the way in.
 
 ---
 
@@ -151,7 +151,7 @@ Click 🎨 in the top bar to switch between Plum & Amber, Greyscale, Ocean, Fore
 
 ## Related
 
-- **drive-backup** (private repo): scripts to back up a Google Drive to Office files, plus `classroom_archive.py` for archiving a course's attachments
+- [drive-backup](https://github.com/ironstamp/drive-backup): scripts to back up a Google Drive to Office files, plus [`classroom_archive.py`](https://github.com/ironstamp/drive-backup/blob/main/docs/classroom-archive.md) for downloading every file attached to a course so it can be rebuilt elsewhere
 
 ---
 
