@@ -85,13 +85,13 @@ You'll need this if you're not an approved test user, or if you're running the t
    - Application type: **Web application**
    - Authorised JavaScript origins: the address you'll serve the page from, e.g. `https://<your-username>.github.io` and `http://localhost:8000` for local testing
 5. Copy the client ID (it ends in `.apps.googleusercontent.com`).
-6. In `index.html`, find this line near the top of the script and replace the ID with yours:
+6. Give the tool your client ID, either way:
+   - **Just for you, in this browser:** on the sign-in screen click **Change Client ID** (or, once signed in, go to **Settings → OAuth Client ID**), paste it in, and sign in again. It's remembered in this browser until you click **Reset to default Client ID & Sign Out**.
+   - **As the default for everyone using your copy:** in `index.html`, replace the ID on this line near the top of the script:
 
-   ```js
-   const HARDCODED_CLIENT_ID = '…apps.googleusercontent.com';
-   ```
-
-> The **OAuth Client ID** field in Settings doesn't currently stick: the hard-coded ID is restored every time the page loads. Edit `index.html` as above instead.
+     ```js
+     const HARDCODED_CLIENT_ID = '…apps.googleusercontent.com';
+     ```
 
 If Google warns that the app is unverified when you sign in, click **Advanced → Go to … (unsafe)**. It's your own app, so that's expected.
 

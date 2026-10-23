@@ -319,7 +319,7 @@ body{font-family:'DM Sans',sans-serif;background:var(--grey-100);color:var(--tex
       <span>🔑</span> Sign in with Google
     </button>
     <div class="auth-divider"></div>
-    <button class="btn btn-ghost btn-sm" onclick="clearClientId()" style="width:100%;justify-content:center;font-size:12px;">Change Client ID</button>
+    <button class="btn btn-ghost btn-sm" onclick="openClientIdSetup()" style="width:100%;justify-content:center;font-size:12px;">Change Client ID</button>
   </div>
 </div>
 
@@ -808,7 +808,7 @@ body{font-family:'DM Sans',sans-serif;background:var(--grey-100);color:var(--tex
               <div class="field">
                 <label>OAuth Client ID</label>
                 <input type="text" id="settings-client-id" style="font-size:12px;">
-                <div class="field-hint">Stored in your browser. Never transmitted externally.</div>
+                <div class="field-hint">Stored in this browser only. Leave as-is to use the built-in ID.</div>
               </div>
               <div>
                 <label style="font-size:11px;font-weight:700;color:var(--plum-dark);letter-spacing:.04em;text-transform:uppercase;display:block;margin-bottom:8px;">Saved Post Times</label>
@@ -818,7 +818,7 @@ body{font-family:'DM Sans',sans-serif;background:var(--grey-100);color:var(--tex
             </div>
           </div>
           <div class="card-footer">
-            <button class="btn btn-danger btn-sm" onclick="clearClientId()">Clear Client ID & Sign Out</button>
+            <button class="btn btn-danger btn-sm" onclick="clearClientId()">Reset to default Client ID & Sign Out</button>
             <button class="btn btn-primary" style="margin-left:auto;" onclick="saveSettings()">Save Settings</button>
           </div>
         </div>
@@ -1059,6 +1059,12 @@ function saveClientId() {
   state.clientId = id;
   tryInitAuth();
   showScreen('auth');
+}
+
+function openClientIdSetup() {
+  document.getElementById('setup-client-id').value = state.clientId || '';
+  document.getElementById('setup-error').style.display = 'none';
+  showScreen('setup');
 }
 
 function clearClientId() {
@@ -2817,12 +2823,16 @@ function populateSettings() {
 }
 
 function saveSettings() {
-  const newId = document.getElementById('settings-client-id').value.trim();
-  if (newId && newId !== state.clientId) {
-    localStorage.setItem('cm_client_id', newId);
-    toast('Client ID updated — sign in again to apply', 'info');
+  const newId = document.getElementById('settings-client-id').value.trim().replace(/^https?:\/\//i, '');
+  if (!newId || newId === state.clientId) { toast('Settings saved', 'success'); return; }
+  if (!newId.endsWith('.apps.googleusercontent.com')) {
+    toast('That doesn\'t look like a valid Client ID — it should end with .apps.googleusercontent.com', 'error', 6000);
+    return;
   }
-  toast('Settings saved', 'success');
+  localStorage.setItem('cm_client_id', newId);
+  state.clientId = newId;
+  tryInitAuth();
+  toast('Client ID saved — sign out and sign in again to use it', 'success', 6000);
 }
 
 function resetTimes() {
@@ -2905,9 +2915,10 @@ document.addEventListener('click', e => {
 });
 
 function init() {
-  // Hardcoded Client ID — no setup screen needed
-  state.clientId = HARDCODED_CLIENT_ID;
-  localStorage.setItem('cm_client_id', HARDCODED_CLIENT_ID);
+  // Use a Client ID saved in this browser, otherwise the built-in default
+  let savedId = null;
+  try { savedId = localStorage.getItem('cm_client_id'); } catch (e) {}
+  state.clientId = savedId || HARDCODED_CLIENT_ID;
   tryInitAuth();
   showScreen('auth');
 
