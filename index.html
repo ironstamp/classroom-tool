@@ -719,7 +719,8 @@ body{font-family:'DM Sans',sans-serif;background:var(--grey-100);color:var(--tex
                         <span id="ul-folder-name" style="font-size:12.5px;color:var(--text-muted);">No folder chosen</span>
                         <input type="file" id="ul-folder-input" webkitdirectory directory multiple style="display:none" onchange="previewArchive(this)">
                       </div>
-                      <label style="display:flex;align-items:center;gap:7px;font-size:13px;cursor:pointer;margin-top:10px;"><input type="checkbox" id="ul-convert" checked style="accent-color:var(--plum)"> Convert Word, Excel and PowerPoint files to Google Docs, Sheets and Slides</label>
+                      <label style="display:flex;align-items:center;gap:7px;font-size:13px;cursor:pointer;margin-top:10px;"><input type="checkbox" id="ul-convert" checked style="accent-color:var(--plum)"> Turn files that were originally Google Docs, Sheets and Slides back into Google format</label>
+                      <div class="field-hint" style="margin:4px 0 0 22px;">Files that were uploaded to Classroom as Word, Excel or PowerPoint stay exactly as they are, so their formatting isn't changed.</div>
                       <div class="field-hint" style="margin-top:6px;">Pick the folder made by <strong>classroom_archive.py</strong> (the one containing <code>course_local.csv</code>). Its files are uploaded to a new folder in your Drive and attached to the right posts.</div>
                     </div>
                   </div>
@@ -2308,12 +2309,27 @@ async function previewArchive(input) {
     for (let k = 1; k < parts.length; k++) dirs.add(parts.slice(0, k).join('/'));
   });
 
+  // manifest.csv records each file's original Drive link: docs.google.com/document|spreadsheets|presentation
+  // means it started as a Google file; drive.google.com/file means an uploaded Word/Excel/PDF etc.
+  let googleNative = null;
+  const manifestFile = all.find(f => f.webkitRelativePath === base + 'manifest.csv');
+  if (manifestFile) {
+    const m = parseCsv(await manifestFile.text());
+    const hdr = (m[0] || []).map(h => h.trim());
+    const iLink = hdr.indexOf('ORIGINAL_LINK'), iPath = hdr.indexOf('LOCAL_PATH');
+    if (iLink >= 0 && iPath >= 0) {
+      googleNative = new Set(m.slice(1)
+        .filter(r => /docs\.google\.com\/(document|spreadsheets|presentation|drawings)\//.test(r[iLink] || '') && r[iPath])
+        .map(r => nfc(r[iPath])));
+    }
+  }
+
   const table = parseCsv(await csvFile.text());
   const rows = table.slice(1).filter(r => r[0]).map(r => { const x = r.slice(0, 11); while (x.length < 11) x.push(''); return x; });
   const plan = rows.map(r => ['ASSIGNMENT', 'MATERIAL'].includes(r[0]) ? resolveArchiveLinks(r[7], files, dirs) : { out: [], missing: [] });
   const courseRow = rows.find(r => r[0] === 'COURSE');
   state.archive = { courseName: courseRow?.[2] || base.replace(/\/$/, '') || 'Course', files, rows, plan,
-                    uploaded: new Map(), folderId: null };
+                    uploaded: new Map(), folderId: null, googleNative };
   document.getElementById('ul-folder-name').textContent = base.replace(/\/$/, '') || csvFile.name;
   if (courseRow?.[2]) document.getElementById('ul-name').placeholder = courseRow[2] + ' (copy)';
   renderArchivePreview();
@@ -2332,6 +2348,11 @@ function renderArchivePreview() {
     if (n > MAX_MATERIALS) over.push({ title: a.rows[i][2] || '(untitled)', n });
   });
   const bytes = [...used].reduce((t, k) => t + (a.files.get(k)?.size || 0), 0);
+  const office = [...used].filter(k => OFFICE_EXT.test(k));
+  const toGoogle = office.filter(k => !a.googleNative || a.googleNative.has(k)).length;
+  const convertNote = !office.length ? '' : a.googleNative
+    ? `<span class="tag" style="background:var(--grey-100);color:var(--text-muted);">🔄 ${toGoogle} back to Google format · ${office.length - toGoogle} kept as Word/Excel/PowerPoint</span>`
+    : `<span class="tag" style="background:#FFF4E5;color:#7A4E00;" title="This archive has no manifest.csv, so originals can't be told apart">⚠️ No manifest.csv - all ${office.length} Office files will be converted (untick the option to keep them as they are)</span>`;
   const mb = (bytes / 1048576).toFixed(1);
   state.uploadPreview = over.length ? null : a.rows; // gate the upload button
 
@@ -2347,6 +2368,7 @@ function renderArchivePreview() {
       <span class="tag" style="background:var(--green-pale);color:var(--green);">📄 ${counts.MATERIAL} materials</span>
       <span class="tag" style="background:var(--amber-pale);color:#7A4E00;">📎 ${used.size} files to upload (${mb} MB)</span>
       <span class="tag" style="background:var(--grey-100);color:var(--text-muted);">🔗 ${links} web links</span>
+      ${convertNote}
     </div>
     <table class="preview-table">
       <thead><tr><th>Type</th><th>Topic</th><th>Title</th><th>Files</th></tr></thead>
@@ -2369,6 +2391,14 @@ const GOOGLE_TYPES = {
   xlsx: 'application/vnd.google-apps.spreadsheet', xls: 'application/vnd.google-apps.spreadsheet',
   pptx: 'application/vnd.google-apps.presentation', ppt: 'application/vnd.google-apps.presentation',
 };
+
+// Should this archive file be converted to Google format? Only if the option is on and the
+// file started life as a Google Doc/Sheet/Slide. Archives without a manifest: convert all Office files.
+function shouldConvert(a, relPath) {
+  if (!document.getElementById('ul-convert').checked) return false;
+  return a.googleNative ? a.googleNative.has(relPath) : true;
+}
+const OFFICE_EXT = /\.(docx?|xlsx?|pptx?)$/i;
 
 async function uploadFileToDrive(file, parentId, convert, relPath) {
   if (state.tokenExpiry && Date.now() > state.tokenExpiry - 60000) {
@@ -2457,7 +2487,6 @@ async function matchExistingUploads(a, folderId, needed) {
 // LINKS point at the new Drive files. Uploaded ids are remembered, so a retry resumes.
 async function prepareArchiveUploads() {
   const a = state.archive;
-  const convert = document.getElementById('ul-convert').checked;
   let needed = [...new Set(a.plan.flatMap(p => p.out.flatMap(o => o.paths || [])))].filter(k => !a.uploaded.has(k));
   if (needed.length) {
     const name = (document.getElementById('ul-name').value.trim() || a.courseName) + ' - course files';
@@ -2481,7 +2510,7 @@ async function prepareArchiveUploads() {
       const file = a.files.get(needed[i]);
       showSpinner(`Uploading files to Drive… ${i + 1} of ${needed.length}`);
       showProgress(i + 1, needed.length, 'Uploading file');
-      a.uploaded.set(needed[i], await uploadFileToDrive(file, a.folderId, convert, needed[i]));
+      a.uploaded.set(needed[i], await uploadFileToDrive(file, a.folderId, shouldConvert(a, needed[i]), needed[i]));
     }
   }
   state.uploadPreview = a.rows.map((r, i) => {
